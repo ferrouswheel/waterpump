@@ -26,14 +26,29 @@ unsigned char flowsensor = 4; // Sensor Input GPIO5 == D1, GPIO4 == D2
 unsigned long currentTime;
 unsigned long cloopTime;
 
-#define FLOW_BUFFER_SIZE 8
-#define FLOW_MIN_SAMPLES 8 // must be <= buffer size
 #define DEBUG_ADC false
 #define DEBUG_FLOW false
 #define DEBUG_PUMP_STATE true
 
-uint16_t flow_retry_period = 10; //10*60; // 10 minutes
-uint8_t flow_retry_max_attempts = 2;
+#define MIN_FLOW 100.0f
+// Probably can be lower when it's not floating. 11.77V ~= 368
+#define PUMP_ON_THRESHOLD 150
+
+#define TESTING 1
+
+#ifdef TESTING
+  #define FLOW_BUFFER_SIZE 8
+  #define FLOW_MIN_SAMPLES 8 // must be <= buffer size
+
+  uint16_t flow_retry_period = 10;
+  uint8_t flow_retry_max_attempts = 2;
+#else
+  #define FLOW_BUFFER_SIZE 256
+  #define FLOW_MIN_SAMPLES 180 // must be <= buffer size
+
+  uint16_t flow_retry_period = 10*60; // 10 minutes
+  uint8_t flow_retry_max_attempts = 2;
+#endif
 
 // Can't currently control the pump directly, unless we add another relay...
 //uint16_t prime_maintenance_period = 60*60; // one hour
@@ -57,7 +72,7 @@ struct PumpState {
   // Ring Buffer
   uint16 ring_buffer_len = 0;
   uint16 ring_buffer_start_idx = 0;
-  // just putting a random start period/frequency in ringbuffer and final_freq - to avoid 0 which will result in no signal.
+  
   float flow_ring_buffer[FLOW_BUFFER_SIZE] = { 0.0f };
   
 };
@@ -190,14 +205,6 @@ void setup() {
 }
 
 void handleWifiClient(WiFiClient& client, PumpState &ps) {
-  // Wait until the client sends some data
-  Serial.println("new client");
-
-  while(client.connected() && !client.available())
-  {
-    delay(1);
-  }
-
   // Read the first line of the request
   String request = client.readStringUntil('\r');
   Serial.println(request);
@@ -208,6 +215,13 @@ void handleWifiClient(WiFiClient& client, PumpState &ps) {
   if (request.indexOf("/LED=ON") != -1) {
     digitalWrite(ledPin, LOW);
     value = HIGH;
+
+    // reset the pump monitor
+    pump_state.pump_override_off = false;
+    pump_state.flow_retry_attempts = 0;
+    // reset ring buffer
+    pump_state.ring_buffer_start_idx = 0;
+    pump_state.ring_buffer_len = 0;
   }
   if (request.indexOf("/LED=OFF") != -1) {
     digitalWrite(ledPin, HIGH);
@@ -245,6 +259,7 @@ void readADCState(PumpState &ps) {
   //int val = adc.readADC(0); // read Channel 0 from MCP3008 ADC (pin 1)
   //Serial.println("ADC == " + String(val));
 
+  // 11.77V = 366
   ps.battery_reading = adc.readADC(0);
   ps.solar_reading = adc.readADC(1);
   ps.water_level_pump_on = adc.readADC(2);
@@ -276,12 +291,26 @@ float calculateFlow() {
   return l_hour;
 }
 
+WiFiClient client;
 
 void loop() {
-  // Check if a client has connected
-  WiFiClient client = server.available();
+  
   if (client) {
-    handleWifiClient(client, pump_state);
+    if(client.connected() && client.available())
+    {
+      // Wait until the client sends some data
+      Serial.println("new client");
+      handleWifiClient(client, pump_state);
+      //delay(1);
+      while (!client.flush(10)) {}
+      client.stop();
+    }
+  } else {
+    // Check if a client has connected
+    WiFiClient c = server.available();
+    if (c) {
+      client = c;
+    }
   }
   
   currentTime = millis();
@@ -291,10 +320,22 @@ void loop() {
     cloopTime = currentTime; // Updates cloopTime
 
     readADCState(pump_state);
-    
+
     float flow_l_per_hour = calculateFlow();
     
     add_to_ring_buffer(pump_state, flow_l_per_hour);
+
+    if (pump_state.water_level_pump_on < PUMP_ON_THRESHOLD) {
+      // If the pump isn't actually going, don't do anything...
+      pump_state.pump_override_off = false;
+      digitalWrite(PUMP_OFF_PIN, LOW);
+      pump_state.flow_retry_attempts = 0;
+      // reset ring buffer
+      pump_state.ring_buffer_start_idx = 0;
+      pump_state.ring_buffer_len = 0;
+      Serial.println("pump is off");
+      return;
+    }
 
     float avg_flow = average_flow_from_buffer(pump_state);
     Serial.println("avg flow " + String(avg_flow));
@@ -307,12 +348,12 @@ void loop() {
     // required samples for measuring avg flow before turn on/off pump
     if (pump_state.ring_buffer_len >= FLOW_MIN_SAMPLES) {
       // change to basing decision off of average flow (but need to only include readings since turned on...)
-      if (avg_flow > 0) { // && !pump_state.pump_override_off) {
+      if (avg_flow > MIN_FLOW) { // && !pump_state.pump_override_off) {
         pump_state.pump_override_off = false;
         // also reset the number of retries
         pump_state.flow_retry_attempts = 0;
 
-      } else if (avg_flow == 0
+      } else if (avg_flow <= MIN_FLOW
         && !pump_state.pump_override_off
         ) {
         pump_state.pump_override_off = true;
